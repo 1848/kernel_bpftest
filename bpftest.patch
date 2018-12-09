@@ -1,0 +1,554 @@
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index e82b7039fc66..2b3e7c88674d 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -39,6 +39,7 @@ struct bpf_map_ops {
+ 	void *(*map_lookup_elem)(struct bpf_map *map, void *key);
+ 	int (*map_update_elem)(struct bpf_map *map, void *key, void *value, u64 flags);
+ 	int (*map_delete_elem)(struct bpf_map *map, void *key);
++	int (*map_delete_elem_if)(struct bpf_map *map, void *key, void *value);
+ 	int (*map_push_elem)(struct bpf_map *map, void *value, u64 flags);
+ 	int (*map_pop_elem)(struct bpf_map *map, void *value);
+ 	int (*map_peek_elem)(struct bpf_map *map, void *value);
+@@ -494,6 +495,11 @@ int bpf_prog_new_fd(struct bpf_prog *prog);
+ int bpf_obj_pin_user(u32 ufd, const char __user *pathname);
+ int bpf_obj_get_user(const char __user *pathname, int flags);
+ 
++#ifdef CONFIG_BPF_HMAP_CTX
++	int bpf_hash_get_ctx(struct bpf_map *map, void *key, void **ctx);
++	int bpf_hash_set_ctx(struct bpf_map *map, void *key, void *ctx);
++#endif
++
+ int bpf_percpu_hash_copy(struct bpf_map *map, void *key, void *value);
+ int bpf_percpu_array_copy(struct bpf_map *map, void *key, void *value);
+ int bpf_percpu_hash_update(struct bpf_map *map, void *key, void *value,
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index a84fd232d934..234564be5cc8 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -104,6 +104,9 @@ enum bpf_cmd {
+ 	BPF_BTF_GET_FD_BY_ID,
+ 	BPF_TASK_FD_QUERY,
+ 	BPF_MAP_LOOKUP_AND_DELETE_ELEM,
++	BPF_MAP_GET_CTX,
++	BPF_MAP_SET_CTX,
++	BPF_MAP_DELETE_ELEM_IF,
+ };
+ 
+ enum bpf_map_type {
+diff --git a/init/Kconfig b/init/Kconfig
+index a4112e95724a..b69d16773600 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1171,6 +1171,11 @@ config HAVE_PCSPKR_PLATFORM
+ config BPF
+ 	bool
+ 
++config BPF_HMAP_CTX
++	bool "Enable context field for hash map"
++	depends on BPF
++	default n
++
+ menuconfig EXPERT
+ 	bool "Configure standard kernel features (expert users)"
+ 	# Unhide debug options, to make the on-by-default options visible
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index 4b7c76765d9d..fc21ce92163a 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -62,6 +62,9 @@ struct htab_elem {
+ 		struct bpf_lru_node lru_node;
+ 	};
+ 	u32 hash;
++#ifdef CONFIG_BPF_HMAP_CTX
++	void *user_context;
++#endif
+ 	char key[0] __aligned(8);
+ };
+ 
+@@ -796,6 +799,11 @@ static struct htab_elem *alloc_htab_elem(struct bpf_htab *htab, void *key,
+ 	}
+ 
+ 	l_new->hash = hash;
++
++#ifdef CONFIG_BPF_HMAP_CTX
++	l_new->user_context = NULL;
++#endif
++
+ 	return l_new;
+ dec_count:
+ 	atomic_dec(&htab->count);
+@@ -1069,7 +1077,10 @@ static int htab_lru_percpu_map_update_elem(struct bpf_map *map, void *key,
+ }
+ 
+ /* Called from syscall or from eBPF program */
+-static int htab_map_delete_elem(struct bpf_map *map, void *key)
++
++
++/* deletes elem only if value is equal */
++static int _htab_map_delete_elem_if(struct bpf_map *map, void *key, void *value, bool percpu)
+ {
+ 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+ 	struct hlist_nulls_head *head;
+@@ -1078,6 +1089,10 @@ static int htab_map_delete_elem(struct bpf_map *map, void *key)
+ 	unsigned long flags;
+ 	u32 hash, key_size;
+ 	int ret = -ENOENT;
++	int eq = 1;
++	int cpu = 0;
++	int off = 0;
++	void *__percpu pptr;
+ 
+ 	WARN_ON_ONCE(!rcu_read_lock_held());
+ 
+@@ -1092,15 +1107,52 @@ static int htab_map_delete_elem(struct bpf_map *map, void *key)
+ 	l = lookup_elem_raw(head, hash, key, key_size);
+ 
+ 	if (l) {
+-		hlist_nulls_del_rcu(&l->hash_node);
+-		free_htab_elem(htab, l);
+-		ret = 0;
++		if(value){
++			u32 size = round_up(htab->map.value_size, 8);
++			if(percpu){
++				pptr = htab_elem_get_ptr(l, key_size);
++				for_each_possible_cpu(cpu) {
++					if(memcmp(value + off, per_cpu_ptr(pptr, cpu), size) != 0){
++						eq = 0;
++						break;
++					}
++					off += size;
++				}
++			} else {
++				eq = memcmp(l->key + round_up(map->key_size, 8), value, size) == 0;
++			}
++		} else {
++			eq = 1;
++		}
++
++		if(eq){
++			hlist_nulls_del_rcu(&l->hash_node);
++			free_htab_elem(htab, l);
++			ret = 0;
++		} else {
++			ret = -EEXIST;
++		}
+ 	}
+ 
+ 	raw_spin_unlock_irqrestore(&b->lock, flags);
+ 	return ret;
+ }
+ 
++static int htab_percpu_map_delete_elem_if(struct bpf_map *map, void *key, void *value)
++{
++	return _htab_map_delete_elem_if(map, key, value, true);
++}
++
++static int htab_map_delete_elem_if(struct bpf_map *map, void *key, void *value)
++{
++	return _htab_map_delete_elem_if(map, key, value, false);
++}
++
++static int htab_map_delete_elem(struct bpf_map *map, void *key)
++{
++	return _htab_map_delete_elem_if(map, key, NULL, false);
++}
++
+ static int htab_lru_map_delete_elem(struct bpf_map *map, void *key)
+ {
+ 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+@@ -1205,6 +1257,7 @@ const struct bpf_map_ops htab_map_ops = {
+ 	.map_lookup_elem = htab_map_lookup_elem,
+ 	.map_update_elem = htab_map_update_elem,
+ 	.map_delete_elem = htab_map_delete_elem,
++	.map_delete_elem_if = htab_map_delete_elem_if,
+ 	.map_gen_lookup = htab_map_gen_lookup,
+ 	.map_seq_show_elem = htab_map_seq_show_elem,
+ };
+@@ -1244,6 +1297,46 @@ static void *htab_lru_percpu_map_lookup_elem(struct bpf_map *map, void *key)
+ 	return NULL;
+ }
+ 
++#ifdef CONFIG_BPF_HMAP_CTX
++int bpf_hash_get_ctx(struct bpf_map *map, void *key, void **ctx)
++{
++	struct htab_elem *l;
++	int ret;
++
++	rcu_read_lock();
++	l = __htab_map_lookup_elem(map, key);
++	if (!l){
++		ret = -ENOENT;
++		goto out;
++	}
++
++	*ctx = l->user_context;
++	ret = 0;
++out:
++	rcu_read_unlock();
++	return ret;
++}
++
++int bpf_hash_set_ctx(struct bpf_map *map, void *key, void *ctx)
++{
++	struct htab_elem *l;
++	int ret;
++
++	rcu_read_lock();
++	l = __htab_map_lookup_elem(map, key);
++	if (!l){
++		ret = -ENOENT;
++		goto out;
++	}
++
++	l->user_context = ctx;
++	ret = 0;
++out:
++	rcu_read_unlock();
++	return ret;
++}
++#endif
++
+ int bpf_percpu_hash_copy(struct bpf_map *map, void *key, void *value)
+ {
+ 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+@@ -1331,6 +1424,7 @@ const struct bpf_map_ops htab_percpu_map_ops = {
+ 	.map_lookup_elem = htab_percpu_map_lookup_elem,
+ 	.map_update_elem = htab_percpu_map_update_elem,
+ 	.map_delete_elem = htab_map_delete_elem,
++	.map_delete_elem_if = htab_percpu_map_delete_elem_if,
+ 	.map_seq_show_elem = htab_percpu_map_seq_show_elem,
+ };
+ 
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index aa05aa38f4a8..3e166be32829 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -662,6 +662,138 @@ static void *__bpf_copy_key(void __user *ukey, u64 key_size)
+ 	return NULL;
+ }
+ 
++static int map_get_ctx(union bpf_attr *attr)
++{
++#ifdef CONFIG_BPF_HMAP_CTX
++	void __user *ukey = u64_to_user_ptr(attr->key);
++	void __user *uvalue = u64_to_user_ptr(attr->value);
++	int ufd = attr->map_fd;
++	struct bpf_map *map;
++	void *key, *value;
++	struct fd f;
++	int err;
++
++	f = fdget(ufd);
++	map = __bpf_map_get(f);
++	if (IS_ERR(map)){
++		return PTR_ERR(map);
++	}
++
++	if (!(f.file->f_mode & FMODE_CAN_READ)) {
++		err = -EPERM;
++		goto err_put;
++	}
++
++	key = __bpf_copy_key(ukey, map->key_size);
++	if (IS_ERR(key)) {
++		err = PTR_ERR(key);
++		goto err_put;
++	}
++
++	value = kmalloc(sizeof(void*), GFP_USER | __GFP_NOWARN);
++	if (!value){
++		err = -ENOMEM;
++		goto free_key;
++	}
++
++	if (bpf_map_is_dev_bound(map)) {
++		err = -ENOSYS;
++	} else if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
++		   map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH ||
++		   map->map_type == BPF_MAP_TYPE_HASH ||
++		   map->map_type == BPF_MAP_TYPE_LRU_HASH) {
++		err = bpf_hash_get_ctx(map, key, value);
++	} else {
++		err = -ENOSYS;
++	}
++
++	if (err)
++		goto free_value;
++
++	err = -EFAULT;
++	if (copy_to_user(uvalue, value, sizeof(void*)) != 0)
++		goto free_value;
++
++	err = 0;
++
++free_value:
++	kfree(value);
++free_key:
++	kfree(key);
++err_put:
++	fdput(f);
++	return err;
++#else
++	return -ENOSYS;
++#endif
++}
++
++static int map_set_ctx(union bpf_attr *attr)
++{
++#ifdef CONFIG_BPF_HMAP_CTX
++	void __user *ukey = u64_to_user_ptr(attr->key);
++	void __user *uvalue = u64_to_user_ptr(attr->value);
++	int ufd = attr->map_fd;
++	struct bpf_map *map;
++	void *key, **value;
++	struct fd f;
++	int err;
++
++	f = fdget(ufd);
++	map = __bpf_map_get(f);
++	if (IS_ERR(map)){
++		return PTR_ERR(map);
++	}
++
++	if (!(f.file->f_mode & FMODE_CAN_WRITE)) {
++		err = -EPERM;
++		goto err_put;
++	}
++
++	key = __bpf_copy_key(ukey, map->key_size);
++	if (IS_ERR(key)) {
++		err = PTR_ERR(key);
++		goto err_put;
++	}
++
++	value = kmalloc(sizeof(void*), GFP_USER | __GFP_NOWARN);
++	if (!value){
++		err = -ENOMEM;
++		goto free_key;
++	}
++
++	if (bpf_map_is_dev_bound(map)) {
++		err = -ENOSYS;
++	} else if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
++		   map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH ||
++		   map->map_type == BPF_MAP_TYPE_HASH ||
++		   map->map_type == BPF_MAP_TYPE_LRU_HASH) {
++		if(copy_from_user(value, uvalue, sizeof(void*)) != 0){
++			err = -EFAULT;
++			goto free_value;
++		}
++		err = bpf_hash_set_ctx(map, key, *value);
++	} else {
++		err = -ENOSYS;
++	}
++
++	if (err)
++		goto free_value;
++
++	err = 0;
++
++free_value:
++	kfree(value);
++free_key:
++	kfree(key);
++err_put:
++	fdput(f);
++	return err;
++#else
++	return -ENOSYS;
++#endif
++}
++
+ /* last field in 'union bpf_attr' used by this command */
+ #define BPF_MAP_LOOKUP_ELEM_LAST_FIELD value
+ 
+@@ -931,6 +1063,71 @@ static int map_delete_elem(union bpf_attr *attr)
+ 	return err;
+ }
+ 
++static int map_delete_elem_if(union bpf_attr *attr)
++{
++	void __user *ukey = u64_to_user_ptr(attr->key);
++	void __user *uvalue = u64_to_user_ptr(attr->value);
++	int ufd = attr->map_fd;
++	struct bpf_map *map;
++	struct fd f;
++	void *key, *value;
++	int value_size;
++	int err;
++
++	f = fdget(ufd);
++	map = __bpf_map_get(f);
++	if (IS_ERR(map))
++		return PTR_ERR(map);
++
++	if (!(f.file->f_mode & FMODE_CAN_WRITE)) {
++		err = -EPERM;
++		goto err_put;
++	}
++
++	key = __bpf_copy_key(ukey, map->key_size);
++	if (IS_ERR(key)) {
++		err = PTR_ERR(key);
++		goto err_put;
++	}
++
++	value_size = round_up(map->value_size, 8) * num_possible_cpus();
++
++	value = kmalloc(value_size, GFP_USER | __GFP_NOWARN);
++	if (!value){
++		err = -ENOMEM;
++		goto out;
++	}
++
++	if(copy_from_user(value, uvalue, value_size) != 0){
++		err = -EFAULT;
++		goto val_del;
++	}
++
++	if (bpf_map_is_dev_bound(map)) {
++		err = -ENOSYS;
++		goto val_del;
++	}
++
++	preempt_disable();
++	__this_cpu_inc(bpf_prog_active);
++	rcu_read_lock();
++	if(map->ops->map_delete_elem_if)
++		err = map->ops->map_delete_elem_if(map, key, value);
++	else
++		err = -ENOSYS;
++	rcu_read_unlock();
++	__this_cpu_dec(bpf_prog_active);
++	preempt_enable();
++	maybe_wait_bpf_programs(map);
++val_del:
++	kfree(value);
++out:
++	kfree(key);
++err_put:
++	fdput(f);
++	return err;
++}
++
+ /* last field in 'union bpf_attr' used by this command */
+ #define BPF_MAP_GET_NEXT_KEY_LAST_FIELD next_key
+ 
+@@ -2588,6 +2785,15 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
+ 	case BPF_MAP_LOOKUP_AND_DELETE_ELEM:
+ 		err = map_lookup_and_delete_elem(&attr);
+ 		break;
++	case BPF_MAP_GET_CTX:
++		err = map_get_ctx(&attr);
++		break;
++	case BPF_MAP_SET_CTX:
++		err = map_set_ctx(&attr);
++		break;
++	case BPF_MAP_DELETE_ELEM_IF:
++		err = map_delete_elem_if(&attr);
++		break;
+ 	default:
+ 		err = -EINVAL;
+ 		break;
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 16263e8827fc..be8370f6e5ee 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -104,6 +104,9 @@ enum bpf_cmd {
+ 	BPF_BTF_GET_FD_BY_ID,
+ 	BPF_TASK_FD_QUERY,
+ 	BPF_MAP_LOOKUP_AND_DELETE_ELEM,
++	BPF_MAP_GET_CTX,
++	BPF_MAP_SET_CTX,
++	BPF_MAP_DELETE_ELEM_IF,
+ };
+ 
+ enum bpf_map_type {
+diff --git a/tools/lib/bpf/bpf.c b/tools/lib/bpf/bpf.c
+index 5c3be06bf0dd..d31a9fec91f3 100644
+--- a/tools/lib/bpf/bpf.c
++++ b/tools/lib/bpf/bpf.c
+@@ -300,6 +300,30 @@ int bpf_verify_program(enum bpf_prog_type type, const struct bpf_insn *insns,
+ 	return sys_bpf(BPF_PROG_LOAD, &attr, sizeof(attr));
+ }
+ 
++int bpf_map_get_ctx(int fd, const void *key, void *ctx)
++{
++	union bpf_attr attr;
++
++	bzero(&attr, sizeof(attr));
++	attr.map_fd = fd;
++	attr.key = ptr_to_u64(key);
++	attr.value = ptr_to_u64(ctx);
++
++	return sys_bpf(BPF_MAP_GET_CTX, &attr, sizeof(attr));
++}
++
++int bpf_map_set_ctx(int fd, const void *key, void *ctx)
++{
++	union bpf_attr attr;
++
++	bzero(&attr, sizeof(attr));
++	attr.map_fd = fd;
++	attr.key = ptr_to_u64(key);
++	attr.value = ptr_to_u64(ctx);
++
++	return sys_bpf(BPF_MAP_SET_CTX, &attr, sizeof(attr));
++}
++
+ int bpf_map_update_elem(int fd, const void *key, const void *value,
+ 			__u64 flags)
+ {
+@@ -349,6 +373,18 @@ int bpf_map_delete_elem(int fd, const void *key)
+ 	return sys_bpf(BPF_MAP_DELETE_ELEM, &attr, sizeof(attr));
+ }
+ 
++int bpf_map_delete_elem_if(int fd, const void *key, const void *value)
++{
++	union bpf_attr attr;
++
++	bzero(&attr, sizeof(attr));
++	attr.map_fd = fd;
++	attr.key = ptr_to_u64(key);
++	attr.value = ptr_to_u64(value);
++
++	return sys_bpf(BPF_MAP_DELETE_ELEM_IF, &attr, sizeof(attr));
++}
++
+ int bpf_map_get_next_key(int fd, const void *key, void *next_key)
+ {
+ 	union bpf_attr attr;
+diff --git a/tools/lib/bpf/bpf.h b/tools/lib/bpf/bpf.h
+index 098e6f793b76..9aaa4f814aed 100644
+--- a/tools/lib/bpf/bpf.h
++++ b/tools/lib/bpf/bpf.h
+@@ -106,10 +106,14 @@ LIBBPF_API int bpf_verify_program(enum bpf_prog_type type,
+ LIBBPF_API int bpf_map_update_elem(int fd, const void *key, const void *value,
+ 				   __u64 flags);
+ 
++LIBBPF_API int bpf_map_get_ctx(int fd, const void *key, void *ctx);
++LIBBPF_API int bpf_map_set_ctx(int fd, const void *key, void *ctx);
++
+ LIBBPF_API int bpf_map_lookup_elem(int fd, const void *key, void *value);
+ LIBBPF_API int bpf_map_lookup_and_delete_elem(int fd, const void *key,
+ 					      void *value);
+ LIBBPF_API int bpf_map_delete_elem(int fd, const void *key);
++LIBBPF_API int bpf_map_delete_elem_if(int fd, const void *key, const void *value);
+ LIBBPF_API int bpf_map_get_next_key(int fd, const void *key, void *next_key);
+ LIBBPF_API int bpf_obj_pin(int fd, const char *pathname);
+ LIBBPF_API int bpf_obj_get(const char *pathname);
+diff --git a/tools/lib/bpf/libbpf.map b/tools/lib/bpf/libbpf.map
+index 8deff22d61bb..2b7ad5cdf7d3 100644
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@ -32,6 +32,9 @@ LIBBPF_0.0.1 {
+ 		bpf_map_lookup_and_delete_elem;
+ 		bpf_map_lookup_elem;
+ 		bpf_map_update_elem;
++		bpf_map_set_ctx;
++		bpf_map_get_ctx;
++		bpf_map_delete_elem_if;
+ 		bpf_obj_get;
+ 		bpf_obj_get_info_by_fd;
+ 		bpf_obj_pin;
